@@ -29,7 +29,7 @@
 pip install coinws
 ```
 
-## 你要的开箱即用封装
+## 客户使用方式（封装接口）
 
 你可以直接这样用：
 
@@ -103,30 +103,6 @@ asyncio.run(main())
 - Binance: `BTCUSDT`
 - OKX: `BTC-USDT` / `BTC-USDT-SWAP`
 - Gate: `BTC_USDT`
-
-## 低层接口（保留）
-
-如果你需要自己处理事件流，可用 `CoinWS.stream`：
-
-```python
-import asyncio
-from coinws import CoinWS
-
-
-async def main():
-    client = CoinWS()
-
-    async for event in client.stream(
-        exchange="okx",
-        channel="quotes",
-        symbols=["BTC-USDT"],
-        market_type="spot",
-    ):
-        print(event)
-
-
-asyncio.run(main())
-```
 
 ## 设计说明
 
