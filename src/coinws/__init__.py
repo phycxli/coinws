@@ -1,3 +1,10 @@
+"""coinws 顶层导出。
+
+对外提供两套入口：
+1. 高层易用入口：`coinws(exchange=...).ws.trades(...)`
+2. 低层流式入口：`CoinWS.stream(...)`
+"""
+
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterable
@@ -30,6 +37,10 @@ async def stream(
     include_raw: bool = False,
     proxy: str | None = None,
 ) -> AsyncIterator[UnifiedEvent]:
+    """顶层便捷流式入口。
+
+    这是 `CoinWS.stream(...)` 的轻量包装，适合快速脚本使用。
+    """
     client = CoinWS(proxy=proxy)
     async for event in client.stream(
         exchange=exchange,

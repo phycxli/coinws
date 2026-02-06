@@ -1,3 +1,19 @@
+"""OKX 公共行情适配器。
+
+支持频道：
+- trades
+- quotes (tickers)
+- funding_rate
+- open_interest
+- mark_price
+- index_price
+
+说明：
+- 衍生品指标类频道（funding/open_interest/mark/index）仅支持 `swap`。
+- `index_price` 频道订阅的是指数 ID（如 BTC-USDT），
+  但输出会映射回原始请求 symbol（如 BTC-USDT-SWAP）。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,11 +36,18 @@ from ..types import (
 from ..utils import SlidingWindowRateLimiter, as_str, now_us, okx_index_inst_id
 
 OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
+
+# 每次 subscribe/unsubscribe 批次大小。
 OKX_SUBSCRIBE_BATCH = 20
+
+# OKX 公共 WS 请求限流（每小时）。
 OKX_MAX_REQ_PER_HOUR = 480
 OKX_REQ_WINDOW_SEC = 3600
+
+# 空闲读取超时；超时后主动 ping。
 OKX_IDLE_PING_SECONDS = 25
 
+# 统一频道名 -> OKX 原生频道名。
 OKX_CHANNEL_MAP: dict[ChannelName, str] = {
     "trades": "trades",
     "quotes": "tickers",
@@ -36,6 +59,10 @@ OKX_CHANNEL_MAP: dict[ChannelName, str] = {
 
 
 def _normalize_size(value) -> str | None:
+    """将 size 转成正数字符串。
+
+    逐笔频道中，某些交易所字段可能带符号；统一这里转为绝对值字符串。
+    """
     if value is None:
         return None
     try:
@@ -45,6 +72,8 @@ def _normalize_size(value) -> str | None:
 
 
 class OkxAdapter(ExchangeAdapter):
+    """OKX 适配器实现。"""
+
     exchange = "okx"
 
     def resolve_market_type(
@@ -53,6 +82,7 @@ class OkxAdapter(ExchangeAdapter):
         channel: ChannelName,
         market_type: MarketType | None,
     ) -> MarketType:
+        """按频道约束 market_type。"""
         if channel in {"funding_rate", "open_interest", "mark_price", "index_price"}:
             resolved = market_type or "swap"
             if resolved != "swap":
@@ -72,13 +102,16 @@ class OkxAdapter(ExchangeAdapter):
         market_type: MarketType,
         include_raw: bool,
     ) -> AsyncIterator[UnifiedEvent]:
+        """建立一次连接，完成订阅并持续解析消息。"""
         okx_channel = OKX_CHANNEL_MAP[channel]
+        # index_price 需要维护“指数ID -> 合约ID列表”映射。
         index_map: dict[str, list[str]] = {}
 
         if channel == "index_price":
             for symbol in symbols:
                 index_id = okx_index_inst_id(symbol)
                 index_map.setdefault(index_id, []).append(symbol)
+            # 实际订阅对象是指数 ID，而不是每个合约 ID。
             subscribe_ids = sorted(index_map.keys())
         else:
             subscribe_ids = symbols
@@ -94,6 +127,7 @@ class OkxAdapter(ExchangeAdapter):
             ping_timeout=20,
             max_size=2**24,
         ) as ws:
+            # 分批订阅并做限流。
             for index in range(0, len(subscribe_ids), OKX_SUBSCRIBE_BATCH):
                 batch = subscribe_ids[index : index + OKX_SUBSCRIBE_BATCH]
                 await limiter.wait()
@@ -102,6 +136,7 @@ class OkxAdapter(ExchangeAdapter):
                     "args": [{"channel": okx_channel, "instId": inst_id} for inst_id in batch],
                 }
                 await ws.send(json.dumps(payload))
+                # 小间隔降低服务端判定风险。
                 await asyncio.sleep(0.05)
 
             while True:
@@ -118,6 +153,10 @@ class OkxAdapter(ExchangeAdapter):
                     yield event
 
     async def _recv_with_ping(self, ws) -> str:
+        """带空闲保活的读取。
+
+        读取超时后主动发 `ping`，再等待一次读取，降低空闲断链概率。
+        """
         try:
             return await asyncio.wait_for(ws.recv(), timeout=OKX_IDLE_PING_SECONDS)
         except asyncio.TimeoutError:
@@ -133,14 +172,18 @@ class OkxAdapter(ExchangeAdapter):
         index_map: dict[str, list[str]],
         include_raw: bool,
     ) -> list[UnifiedEvent]:
+        """解析 OKX 原始消息为统一事件列表。"""
         data = self._json_loads(payload)
         if not isinstance(data, dict):
             return []
 
         event = data.get("event")
+
+        # 订阅确认类消息不产出行情事件。
         if event in {"subscribe", "unsubscribe"}:
             return []
 
+        # 服务端错误直接抛出，让上层重连策略接管。
         if event == "error":
             message = data.get("msg") or "unknown OKX error"
             raise RuntimeError(f"OKX 订阅错误: {message} code={data.get('code')}")
@@ -165,6 +208,7 @@ class OkxAdapter(ExchangeAdapter):
             ts_us = int(ts_raw) * 1000
             local_ts = now_us()
 
+            # ===== trades =====
             if channel == "trades":
                 symbol = as_str(item.get("instId") or arg.get("instId"))
                 if not symbol:
@@ -186,6 +230,7 @@ class OkxAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # ===== quotes =====
             if channel == "quotes":
                 symbol = as_str(item.get("instId") or arg.get("instId"))
                 if not symbol:
@@ -207,6 +252,7 @@ class OkxAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # ===== funding_rate =====
             if channel == "funding_rate":
                 symbol = as_str(item.get("instId") or arg.get("instId"))
                 if not symbol:
@@ -229,6 +275,7 @@ class OkxAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # ===== open_interest =====
             if channel == "open_interest":
                 symbol = as_str(item.get("instId") or arg.get("instId"))
                 if not symbol:
@@ -247,6 +294,7 @@ class OkxAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # ===== mark_price =====
             if channel == "mark_price":
                 symbol = as_str(item.get("instId") or arg.get("instId"))
                 if not symbol:
@@ -265,11 +313,13 @@ class OkxAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # ===== index_price =====
             if channel == "index_price":
                 index_id = as_str(arg.get("instId"))
                 if not index_id:
                     continue
                 index_price = as_str(item.get("idxPx"))
+                # 将指数价同步映射到该指数下的全部合约 symbol。
                 for symbol in index_map.get(index_id, []):
                     result.append(
                         IndexPriceEvent(

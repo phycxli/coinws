@@ -1,3 +1,5 @@
+"""对外统一客户端（底层流式 API）。"""
+
 from __future__ import annotations
 
 import logging
@@ -24,7 +26,7 @@ class CoinWS:
     说明：
     - 仅支持公共行情频道。
     - 默认自动重连，并在重连后自动重新订阅。
-    - 所有输出均为统一字段事件对象（dataclass）。
+    - 输出为统一字段事件对象（dataclass）。
     """
 
     def __init__(
@@ -41,6 +43,7 @@ class CoinWS:
         self._logger = logger or logging.getLogger("coinws")
 
     def _build_adapter(self, exchange: ExchangeName):
+        """根据交易所名选择适配器实现。"""
         common_kwargs = {
             "proxy": self._proxy,
             "reconnect_delay": self._reconnect_delay,
@@ -64,6 +67,7 @@ class CoinWS:
         market_type: MarketType | None = None,
         include_raw: bool = False,
     ) -> AsyncIterator[UnifiedEvent]:
+        """统一流式入口。"""
         adapter = self._build_adapter(exchange)
         async for event in adapter.stream(
             channel=channel,
@@ -81,6 +85,7 @@ class CoinWS:
         market_type: MarketType | None = None,
         include_raw: bool = False,
     ) -> AsyncIterator[TradeEvent]:
+        """快捷订阅：逐笔成交。"""
         async for event in self.stream(
             exchange=exchange,
             channel="trades",
@@ -98,6 +103,7 @@ class CoinWS:
         market_type: MarketType | None = None,
         include_raw: bool = False,
     ) -> AsyncIterator[QuoteEvent]:
+        """快捷订阅：最优档行情。"""
         async for event in self.stream(
             exchange=exchange,
             channel="quotes",
@@ -115,6 +121,7 @@ class CoinWS:
         market_type: MarketType | None = "swap",
         include_raw: bool = False,
     ) -> AsyncIterator[FundingRateEvent]:
+        """快捷订阅：资金费率。"""
         async for event in self.stream(
             exchange=exchange,
             channel="funding_rate",
@@ -132,6 +139,7 @@ class CoinWS:
         market_type: MarketType | None = "swap",
         include_raw: bool = False,
     ) -> AsyncIterator[OpenInterestEvent]:
+        """快捷订阅：持仓量。"""
         async for event in self.stream(
             exchange=exchange,
             channel="open_interest",
@@ -149,6 +157,7 @@ class CoinWS:
         market_type: MarketType | None = "swap",
         include_raw: bool = False,
     ) -> AsyncIterator[MarkPriceEvent]:
+        """快捷订阅：标记价格。"""
         async for event in self.stream(
             exchange=exchange,
             channel="mark_price",
@@ -166,6 +175,7 @@ class CoinWS:
         market_type: MarketType | None = "swap",
         include_raw: bool = False,
     ) -> AsyncIterator[IndexPriceEvent]:
+        """快捷订阅：指数价格。"""
         async for event in self.stream(
             exchange=exchange,
             channel="index_price",

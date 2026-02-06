@@ -1,3 +1,19 @@
+"""Gate.io 公共行情适配器。
+
+支持频道：
+- trades
+- quotes (book_ticker)
+- funding_rate
+- open_interest
+- mark_price
+- index_price
+
+说明：
+- Gate 的现货与永续使用不同 WS 地址。
+- 部分频道依赖应用层 ping（spot.ping / futures.ping）维持连接。
+- 衍生品指标类频道均通过 `futures.tickers` 解析。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -27,11 +43,17 @@ from ..utils import (
 
 GATE_SPOT_WS_URL = "wss://api.gateio.ws/ws/v4/"
 GATE_SWAP_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+
+# 单次订阅请求的最大符号数。
 GATE_SUBSCRIBE_BATCH = 100
+
+# Gate 应用层 ping 的发送间隔（秒）。
 GATE_APP_PING_SECONDS = 10
 
 
 class GateAdapter(ExchangeAdapter):
+    """Gate 适配器实现。"""
+
     exchange = "gate"
 
     def resolve_market_type(
@@ -40,6 +62,11 @@ class GateAdapter(ExchangeAdapter):
         channel: ChannelName,
         market_type: MarketType | None,
     ) -> MarketType:
+        """按频道约束 market_type。
+
+        备注：
+        - Gate 无独立 `futures` 标识，这里将 `futures` 归一到 `swap`。
+        """
         if channel in {"funding_rate", "open_interest", "mark_price", "index_price"}:
             resolved = market_type or "swap"
             if resolved != "swap":
@@ -61,8 +88,11 @@ class GateAdapter(ExchangeAdapter):
         market_type: MarketType,
         include_raw: bool,
     ) -> AsyncIterator[UnifiedEvent]:
+        """建立一次连接并持续解析行情。"""
         ws_url = GATE_SPOT_WS_URL if market_type == "spot" else GATE_SWAP_WS_URL
         gate_channel = self._gate_channel(channel=channel, market_type=market_type)
+
+        # 合约频道建议携带 X-Gate-Size-Decimal，返回更稳定的小数格式。
         headers = {"X-Gate-Size-Decimal": "1"} if market_type == "swap" else None
 
         async with self._connect(
@@ -73,6 +103,8 @@ class GateAdapter(ExchangeAdapter):
             additional_headers=headers,
         ) as ws:
             await self._subscribe(ws, gate_channel=gate_channel, symbols=symbols)
+
+            # Gate 常需要应用层 ping 保活。
             ping_stop = asyncio.Event()
             ping_task = asyncio.create_task(
                 self._ping_loop(
@@ -97,6 +129,7 @@ class GateAdapter(ExchangeAdapter):
                 ping_task.cancel()
 
     async def _subscribe(self, ws, *, gate_channel: str, symbols: list[str]) -> None:
+        """按批次发送订阅请求。"""
         for index in range(0, len(symbols), GATE_SUBSCRIBE_BATCH):
             batch = symbols[index : index + GATE_SUBSCRIBE_BATCH]
             payload = {
@@ -109,16 +142,19 @@ class GateAdapter(ExchangeAdapter):
             await asyncio.sleep(0.05)
 
     async def _ping_loop(self, *, ws, ping_channel: str, stop_event: asyncio.Event) -> None:
+        """应用层 ping 循环。"""
         while not stop_event.is_set():
             await asyncio.sleep(GATE_APP_PING_SECONDS)
             try:
                 payload = {"time": int(time.time()), "channel": ping_channel}
                 await ws.send(json.dumps(payload))
             except Exception:
+                # 连接异常时退出，由上层统一重连。
                 return
 
     @staticmethod
     def _gate_channel(*, channel: ChannelName, market_type: MarketType) -> str:
+        """统一频道名映射到 Gate 原生频道。"""
         if channel == "trades":
             return "spot.trades" if market_type == "spot" else "futures.trades"
         if channel == "quotes":
@@ -136,20 +172,25 @@ class GateAdapter(ExchangeAdapter):
         payload: str,
         include_raw: bool,
     ) -> list[UnifiedEvent]:
+        """将 Gate 原始消息解析为统一事件。"""
         data = self._json_loads(payload)
         if not isinstance(data, dict):
             return []
 
+        # 过滤应用层 pong。
         if data.get("channel") in {"spot.pong", "futures.pong"}:
             return []
 
         event = data.get("event")
+
+        # 订阅确认消息。
         if event == "subscribe":
             result = data.get("result")
             if isinstance(result, dict) and result.get("status") not in {None, "success"}:
                 raise RuntimeError(f"Gate 订阅失败: {data.get('error')}")
             return []
 
+        # 只处理目标频道 update 数据。
         if event != "update" or data.get("channel") != gate_channel:
             return []
 
@@ -165,6 +206,7 @@ class GateAdapter(ExchangeAdapter):
             if not isinstance(item, dict):
                 continue
 
+            # ===== trades =====
             if channel == "trades":
                 out.extend(
                     self._parse_trade(
@@ -176,6 +218,7 @@ class GateAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # ===== quotes =====
             if channel == "quotes":
                 out.extend(
                     self._parse_quote(
@@ -187,12 +230,15 @@ class GateAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # 以下四类均来源于 futures.tickers。
             symbol = as_str(item.get("contract"))
             ts_us = parse_epoch_to_us(item.get("t") or item.get("time"))
             if not symbol or ts_us is None:
                 continue
 
             local_ts = now_us()
+
+            # ===== funding_rate =====
             if channel == "funding_rate":
                 funding_rate = as_str(item.get("funding_rate"))
                 if funding_rate is None:
@@ -213,6 +259,7 @@ class GateAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # ===== open_interest =====
             if channel == "open_interest":
                 open_interest = as_str(item.get("total_size"))
                 if open_interest is None:
@@ -231,6 +278,7 @@ class GateAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # ===== mark_price =====
             if channel == "mark_price":
                 mark_price = as_str(item.get("mark_price"))
                 if mark_price is None:
@@ -249,6 +297,7 @@ class GateAdapter(ExchangeAdapter):
                 )
                 continue
 
+            # ===== index_price =====
             if channel == "index_price":
                 index_price = as_str(item.get("index_price"))
                 if index_price is None:
@@ -276,6 +325,7 @@ class GateAdapter(ExchangeAdapter):
         include_raw: bool,
         raw,
     ) -> list[TradeEvent]:
+        """解析逐笔成交条目。"""
         if market_type == "spot":
             symbol = as_str(item.get("currency_pair") or item.get("s"))
             ts_us = parse_epoch_to_us(
@@ -296,6 +346,7 @@ class GateAdapter(ExchangeAdapter):
                 or item.get("t")
                 or item.get("time")
             )
+            # 合约成交量/方向做统一规整。
             side, amount = gate_normalize_futures_side_and_amount(
                 item.get("size"), item.get("side")
             )
@@ -329,6 +380,7 @@ class GateAdapter(ExchangeAdapter):
         include_raw: bool,
         raw,
     ) -> list[QuoteEvent]:
+        """解析最优档条目。"""
         symbol = as_str(pick_first(item, ["s", "currency_pair", "contract"]))
         ts_us = parse_epoch_to_us(
             pick_first(item, ["t", "T", "time", "ts", "timestamp"])

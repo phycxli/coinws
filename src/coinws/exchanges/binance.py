@@ -1,3 +1,18 @@
+"""Binance 公共行情适配器。
+
+支持频道：
+- trades
+- quotes (bookTicker)
+- funding_rate
+- open_interest
+- mark_price
+- index_price
+
+说明：
+- `funding_rate/open_interest/mark_price/index_price` 仅支持 `swap`。
+- 解析后统一输出 coinws 的标准事件对象。
+"""
+
 from __future__ import annotations
 
 import json
@@ -18,16 +33,20 @@ from ..types import (
 )
 from ..utils import as_str, now_us
 
+# 不同市场类型对应不同 WS 域名。
 BINANCE_WS_URLS: dict[MarketType, str] = {
     "spot": "wss://stream.binance.com/ws",
     "swap": "wss://fstream.binance.com/ws",
     "futures": "wss://dstream.binance.com/ws",
 }
 
+# Binance 单次 SUBSCRIBE 请求建议不要过大。
 BINANCE_BATCH_SIZE = 100
 
 
 class BinanceAdapter(ExchangeAdapter):
+    """Binance 适配器实现。"""
+
     exchange = "binance"
 
     def resolve_market_type(
@@ -36,6 +55,8 @@ class BinanceAdapter(ExchangeAdapter):
         channel: ChannelName,
         market_type: MarketType | None,
     ) -> MarketType:
+        """按频道约束解析 market_type。"""
+        # 衍生品指标类频道只在永续市场可用。
         if channel in {"funding_rate", "open_interest", "mark_price", "index_price"}:
             resolved = market_type or "swap"
             if resolved != "swap":
@@ -55,6 +76,7 @@ class BinanceAdapter(ExchangeAdapter):
         market_type: MarketType,
         include_raw: bool,
     ) -> AsyncIterator[UnifiedEvent]:
+        """建立一次 WS 连接并持续输出事件。"""
         ws_url = BINANCE_WS_URLS[market_type]
 
         async with self._connect(
@@ -74,18 +96,22 @@ class BinanceAdapter(ExchangeAdapter):
                     yield event
 
     async def _subscribe(self, ws, *, channel: ChannelName, symbols: list[str]) -> None:
+        """发送订阅请求（按批次）。"""
         stream_suffix = self._stream_suffix(channel)
         params = [f"{symbol.lower()}@{stream_suffix}" for symbol in symbols]
 
+        # 使用同一 id 便于服务端侧追踪本次订阅批处理。
         sub_id = int(time.time() * 1000) % 1_000_000
         for index in range(0, len(params), BINANCE_BATCH_SIZE):
             batch = params[index : index + BINANCE_BATCH_SIZE]
             payload = {"method": "SUBSCRIBE", "params": batch, "id": sub_id}
             await ws.send(json.dumps(payload))
+            # 等待服务端确认，减少一次发太快造成的确认堆积。
             await ws.recv()
 
     @staticmethod
     def _stream_suffix(channel: ChannelName) -> str:
+        """把统一频道名映射为 Binance 流后缀。"""
         if channel == "trades":
             return "trade"
         if channel == "quotes":
@@ -104,16 +130,19 @@ class BinanceAdapter(ExchangeAdapter):
         payload: str,
         include_raw: bool,
     ) -> list[UnifiedEvent]:
+        """将 Binance 原始消息解析成统一事件列表。"""
         data = self._json_loads(payload)
         if not isinstance(data, dict):
             return []
 
+        # SUBSCRIBE/UNSUBSCRIBE 的确认包：{"result": null, "id": ...}
         if data.get("result") is None and "id" in data:
             return []
 
         raw = data if include_raw else None
         event_type = data.get("e")
 
+        # ===== trades =====
         if channel == "trades":
             if event_type != "trade":
                 return []
@@ -128,6 +157,7 @@ class BinanceAdapter(ExchangeAdapter):
                     timestamp=ts_us,
                     local_timestamp=now_us(),
                     trade_id=as_str(data.get("t")),
+                    # m=True 表示做市方是买方，主动方为卖，因此这里记作 sell。
                     side="sell" if data.get("m") else "buy",
                     price=as_str(data.get("p")),
                     amount=as_str(data.get("q")),
@@ -135,7 +165,9 @@ class BinanceAdapter(ExchangeAdapter):
                 )
             ]
 
+        # ===== quotes (bookTicker) =====
         if channel == "quotes":
+            # 某些情况下 event 字段可能为空，兼容处理。
             if event_type is not None and event_type != "bookTicker":
                 return []
             symbol = as_str(data.get("s"))
@@ -159,6 +191,7 @@ class BinanceAdapter(ExchangeAdapter):
                 )
             ]
 
+        # ===== open interest =====
         if event_type == "openInterest" and channel == "open_interest":
             symbol = as_str(data.get("s"))
             ts_ms = data.get("E")
@@ -177,6 +210,7 @@ class BinanceAdapter(ExchangeAdapter):
                 )
             ]
 
+        # 下方三类都来自 markPriceUpdate。
         if event_type != "markPriceUpdate":
             return []
 
@@ -187,6 +221,7 @@ class BinanceAdapter(ExchangeAdapter):
 
         ts_us = int(ts_ms) * 1000
 
+        # ===== funding rate =====
         if channel == "funding_rate":
             funding_rate = data.get("r")
             if funding_rate is None:
@@ -208,6 +243,7 @@ class BinanceAdapter(ExchangeAdapter):
                 )
             ]
 
+        # ===== mark price =====
         if channel == "mark_price":
             mark_price = data.get("p")
             if mark_price is None:
@@ -225,6 +261,7 @@ class BinanceAdapter(ExchangeAdapter):
                 )
             ]
 
+        # ===== index price =====
         if channel == "index_price":
             index_price = data.get("i")
             if index_price is None:

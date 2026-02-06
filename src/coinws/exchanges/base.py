@@ -1,3 +1,14 @@
+"""交易所适配器抽象层。
+
+职责：
+1. 统一外部调用入口 `stream(...)`。
+2. 统一做参数校验、symbol 标准化。
+3. 统一做自动重连与退避。
+4. 具体交易所只需实现：
+   - `resolve_market_type(...)`
+   - `_stream_once(...)`
+"""
+
 from __future__ import annotations
 
 import abc
@@ -13,6 +24,8 @@ from ..utils import ensure_symbols, jittered_sleep_seconds, normalize_symbol
 
 
 class ExchangeAdapter(abc.ABC):
+    """所有交易所适配器的基类。"""
+
     exchange: ExchangeName
 
     def __init__(
@@ -36,6 +49,13 @@ class ExchangeAdapter(abc.ABC):
         market_type: MarketType | None = None,
         include_raw: bool = False,
     ) -> AsyncIterator[UnifiedEvent]:
+        """统一流式入口。
+
+        关键逻辑：
+        - 频道校验
+        - symbol 标准化
+        - 连接异常时自动重连（指数退避 + 抖动）
+        """
         if channel not in SUPPORTED_CHANNELS:
             raise ValueError(f"不支持的频道: {channel}")
 
@@ -55,9 +75,11 @@ class ExchangeAdapter(abc.ABC):
                     include_raw=include_raw,
                 ):
                     got_event = True
+                    # 一旦收到正常事件，就重置退避时间。
                     backoff = self._reconnect_delay
                     yield event
 
+                # 连接正常结束但没有事件，也按可恢复场景处理。
                 if not got_event:
                     self._logger.warning(
                         "%s %s 流无数据返回，%.1fs 后重连",
@@ -66,6 +88,7 @@ class ExchangeAdapter(abc.ABC):
                         backoff,
                     )
             except asyncio.CancelledError:
+                # 任务被上层取消时直接抛出，避免吞掉取消信号。
                 raise
             except Exception as exc:
                 self._logger.warning(
@@ -88,6 +111,7 @@ class ExchangeAdapter(abc.ABC):
         channel: ChannelName,
         market_type: MarketType | None,
     ) -> MarketType:
+        """将调用方 market_type 解析为当前交易所可接受的值。"""
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -99,6 +123,12 @@ class ExchangeAdapter(abc.ABC):
         market_type: MarketType,
         include_raw: bool,
     ) -> AsyncIterator[UnifiedEvent]:
+        """建立一次 WS 连接并输出事件。
+
+        约定：
+        - 方法内部只处理“单次连接生命周期”。
+        - 断线重连由基类 `stream(...)` 统一处理。
+        """
         raise NotImplementedError
 
     def _connect(
@@ -110,6 +140,7 @@ class ExchangeAdapter(abc.ABC):
         max_size: int = 2**24,
         additional_headers: dict[str, str] | None = None,
     ):
+        """统一 WS 连接参数封装。"""
         return websockets.connect(
             ws_url,
             ping_interval=ping_interval,
@@ -121,4 +152,5 @@ class ExchangeAdapter(abc.ABC):
 
     @staticmethod
     def _json_loads(payload: str) -> dict:
+        """JSON 解析封装，便于子类复用与测试替换。"""
         return json.loads(payload)
