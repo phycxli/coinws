@@ -170,9 +170,23 @@ class CsvEventSink:
 class MarketWebSocket:
     """单交易所 WS 业务接口（客户调用的核心对象）。"""
 
-    def __init__(self, *, client: CoinWS, exchange: ExchangeName) -> None:
+    def __init__(
+        self,
+        *,
+        client: CoinWS,
+        exchange: ExchangeName,
+        default_proxy: str | None = None,
+    ) -> None:
         self._client = client
         self._exchange = exchange
+        # 当前 ws 对象的代理变量。
+        # 默认值来自 coinws(exchange=..., proxy=...) 传入的初始代理。
+        # 客户可在运行时通过 self.proxy 或 set_proxy() 动态修改。
+        self.proxy: str | None = default_proxy
+
+    def set_proxy(self, proxy: str | None) -> None:
+        """设置当前 ws 对象的代理变量。"""
+        self.proxy = proxy
 
     async def _stream(
         self,
@@ -182,6 +196,9 @@ class MarketWebSocket:
         symbols: list[str],
         include_raw: bool,
     ) -> AsyncIterator[UnifiedEvent]:
+        """内部统一流式入口。"""
+        # 每次发起订阅前，把 ws 变量中的代理同步到底层客户端。
+        self._client.set_proxy(self.proxy)
         async for event in self._client.stream(
             exchange=self._exchange,
             channel=channel,
@@ -201,6 +218,7 @@ class MarketWebSocket:
         include_raw: bool,
         limit: int | None,
     ) -> int:
+        """消费流式数据并按需写入 CSV，返回处理事件条数。"""
         sink = CsvEventSink(save_path) if save_path else None
         count = 0
         try:
@@ -229,6 +247,7 @@ class MarketWebSocket:
         include_raw: bool = False,
         limit: int | None = None,
     ) -> int:
+        """订阅逐笔成交。"""
         target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
         return await self._consume(
             channel="trades",
@@ -249,6 +268,7 @@ class MarketWebSocket:
         include_raw: bool = False,
         limit: int | None = None,
     ) -> int:
+        """订阅最优档行情。"""
         target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
         return await self._consume(
             channel="quotes",
@@ -269,6 +289,7 @@ class MarketWebSocket:
         include_raw: bool = False,
         limit: int | None = None,
     ) -> int:
+        """订阅资金费率。"""
         target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
         return await self._consume(
             channel="funding_rate",
@@ -289,6 +310,7 @@ class MarketWebSocket:
         include_raw: bool = False,
         limit: int | None = None,
     ) -> int:
+        """订阅持仓量。"""
         target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
         return await self._consume(
             channel="open_interest",
@@ -309,6 +331,7 @@ class MarketWebSocket:
         include_raw: bool = False,
         limit: int | None = None,
     ) -> int:
+        """订阅标记价格。"""
         target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
         return await self._consume(
             channel="mark_price",
@@ -329,6 +352,7 @@ class MarketWebSocket:
         include_raw: bool = False,
         limit: int | None = None,
     ) -> int:
+        """订阅指数价格。"""
         target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
         return await self._consume(
             channel="index_price",
@@ -357,7 +381,11 @@ class ExchangeGateway:
             reconnect_delay=reconnect_delay,
             max_reconnect_delay=max_reconnect_delay,
         )
-        self.ws = MarketWebSocket(client=self._client, exchange=exchange)
+        self.ws = MarketWebSocket(
+            client=self._client,
+            exchange=exchange,
+            default_proxy=proxy,
+        )
 
 
 def coinws(

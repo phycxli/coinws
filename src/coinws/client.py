@@ -42,6 +42,10 @@ class CoinWS:
         self._max_reconnect_delay = max_reconnect_delay
         self._logger = logger or logging.getLogger("coinws")
 
+    def set_proxy(self, proxy: str | None) -> None:
+        """设置客户端代理地址。"""
+        self._proxy = proxy
+
     def _build_adapter(self, exchange: ExchangeName):
         """根据交易所名选择适配器实现。"""
         common_kwargs = {

@@ -29,6 +29,14 @@
 pip install coinws
 ```
 
+## 最简代理示例
+
+```python
+exchange = coinws(exchange="binance")
+exchange.ws.proxy = "http://127.0.0.1:7890"
+await exchange.ws.trades(exchange_type="spot", symbol="BTCUSDT")
+```
+
 ## 客户使用方式（封装接口）
 
 你可以直接这样用：
@@ -57,6 +65,37 @@ asyncio.run(main())
 - 不断流式接收
 - 以 CSV 追加模式保存到 `save_path`
 - 文件名形如：`data/binance/spot/trades_BTCUSDT.csv`
+
+## 代理（VPN / Proxy）支持
+
+支持两种配置方式：
+
+1) 初始化默认代理（当前 `exchange` 下所有订阅默认生效）：
+
+```python
+exchange = coinws(exchange="binance", proxy="http://127.0.0.1:7890")
+await exchange.ws.trades(exchange_type="spot", symbol="BTCUSDT")
+```
+
+2) 在 `ws` 对象上设置代理变量（不走函数传参）：
+
+```python
+exchange = coinws(exchange="binance")
+exchange.ws.proxy = "http://127.0.0.1:7890"
+
+await exchange.ws.trades(
+    exchange_type="spot",
+    symbol="BTCUSDT",
+)
+```
+
+也可以使用方法设置：
+
+```python
+exchange.ws.set_proxy("socks5://127.0.0.1:1080")
+```
+
+> `proxy` 示例：`http://127.0.0.1:7890`、`socks5://127.0.0.1:1080`
 
 ### `ws` 方法列表
 
