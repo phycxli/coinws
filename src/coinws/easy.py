@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+import csv
+from collections.abc import AsyncIterator, Iterable, Sequence
+from pathlib import Path
+
+from .client import CoinWS
+from .types import (
+    ChannelName,
+    ExchangeName,
+    FundingRateEvent,
+    IndexPriceEvent,
+    MarkPriceEvent,
+    MarketType,
+    OpenInterestEvent,
+    QuoteEvent,
+    TradeEvent,
+    UnifiedEvent,
+)
+
+
+def _as_text(value) -> str:
+    return "" if value is None else str(value)
+
+
+def _normalize_symbols(
+    *,
+    symbol: str | None,
+    symbols: str | Sequence[str] | Iterable[str] | None,
+) -> list[str]:
+    if symbol and symbols is not None:
+        raise ValueError("symbol 和 symbols 不能同时传")
+
+    if symbol is not None:
+        items = [symbol]
+    elif symbols is None:
+        raise ValueError("必须传 symbol 或 symbols")
+    elif isinstance(symbols, str):
+        items = [symbols]
+    else:
+        items = [item for item in symbols if item]
+
+    if not items:
+        raise ValueError("symbol/symbols 不能为空")
+    return items
+
+
+class CsvEventSink:
+    def __init__(self, base_dir: str | Path) -> None:
+        self._base_dir = Path(base_dir)
+        self._base_dir.mkdir(parents=True, exist_ok=True)
+        self._handles: dict[Path, tuple] = {}
+
+    def _path_for(self, event: UnifiedEvent) -> Path:
+        return self._base_dir / f"{event.channel}_{event.symbol}.csv"
+
+    def _header_row(self, event: UnifiedEvent) -> tuple[list[str], list[str]]:
+        common_header = [
+            "exchange",
+            "market_type",
+            "channel",
+            "symbol",
+            "timestamp",
+            "local_timestamp",
+        ]
+        common_row = [
+            _as_text(event.exchange),
+            _as_text(event.market_type),
+            _as_text(event.channel),
+            _as_text(event.symbol),
+            _as_text(event.timestamp),
+            _as_text(event.local_timestamp),
+        ]
+
+        if isinstance(event, TradeEvent):
+            return (
+                common_header + ["trade_id", "side", "price", "amount"],
+                common_row
+                + [
+                    _as_text(event.trade_id),
+                    _as_text(event.side),
+                    _as_text(event.price),
+                    _as_text(event.amount),
+                ],
+            )
+
+        if isinstance(event, QuoteEvent):
+            return (
+                common_header + ["ask_price", "ask_amount", "bid_price", "bid_amount"],
+                common_row
+                + [
+                    _as_text(event.ask_price),
+                    _as_text(event.ask_amount),
+                    _as_text(event.bid_price),
+                    _as_text(event.bid_amount),
+                ],
+            )
+
+        if isinstance(event, FundingRateEvent):
+            return (
+                common_header + ["funding_rate", "funding_time", "next_funding_time"],
+                common_row
+                + [
+                    _as_text(event.funding_rate),
+                    _as_text(event.funding_time),
+                    _as_text(event.next_funding_time),
+                ],
+            )
+
+        if isinstance(event, OpenInterestEvent):
+            return (
+                common_header + ["open_interest"],
+                common_row + [_as_text(event.open_interest)],
+            )
+
+        if isinstance(event, MarkPriceEvent):
+            return (
+                common_header + ["mark_price"],
+                common_row + [_as_text(event.mark_price)],
+            )
+
+        if isinstance(event, IndexPriceEvent):
+            return (
+                common_header + ["index_price"],
+                common_row + [_as_text(event.index_price)],
+            )
+
+        return common_header, common_row
+
+    def write(self, event: UnifiedEvent) -> None:
+        path = self._path_for(event)
+        if path not in self._handles:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            file_handle = open(path, "a", encoding="utf-8", newline="")
+            writer = csv.writer(file_handle)
+            if path.stat().st_size == 0:
+                header, _ = self._header_row(event)
+                writer.writerow(header)
+            self._handles[path] = (file_handle, writer)
+
+        file_handle, writer = self._handles[path]
+        _, row = self._header_row(event)
+        writer.writerow(row)
+        file_handle.flush()
+
+    def close(self) -> None:
+        for file_handle, _ in self._handles.values():
+            file_handle.flush()
+            file_handle.close()
+        self._handles.clear()
+
+
+class WSFacade:
+    def __init__(self, *, client: CoinWS, exchange: ExchangeName) -> None:
+        self._client = client
+        self._exchange = exchange
+
+    async def _stream(
+        self,
+        *,
+        channel: ChannelName,
+        exchange_type: MarketType,
+        symbols: list[str],
+        include_raw: bool,
+    ) -> AsyncIterator[UnifiedEvent]:
+        async for event in self._client.stream(
+            exchange=self._exchange,
+            channel=channel,
+            symbols=symbols,
+            market_type=exchange_type,
+            include_raw=include_raw,
+        ):
+            yield event
+
+    async def _consume(
+        self,
+        *,
+        channel: ChannelName,
+        exchange_type: MarketType,
+        symbols: list[str],
+        save_path: str | Path | None,
+        include_raw: bool,
+        limit: int | None,
+    ) -> int:
+        sink = CsvEventSink(save_path) if save_path else None
+        count = 0
+        try:
+            async for event in self._stream(
+                channel=channel,
+                exchange_type=exchange_type,
+                symbols=symbols,
+                include_raw=include_raw,
+            ):
+                if sink:
+                    sink.write(event)
+                count += 1
+                if limit is not None and count >= limit:
+                    return count
+        finally:
+            if sink:
+                sink.close()
+
+    async def trades(
+        self,
+        *,
+        exchange_type: MarketType = "spot",
+        symbol: str | None = None,
+        symbols: str | Sequence[str] | Iterable[str] | None = None,
+        save_path: str | Path | None = None,
+        include_raw: bool = False,
+        limit: int | None = None,
+    ) -> int:
+        target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
+        return await self._consume(
+            channel="trades",
+            exchange_type=exchange_type,
+            symbols=target_symbols,
+            save_path=save_path,
+            include_raw=include_raw,
+            limit=limit,
+        )
+
+    async def quotes(
+        self,
+        *,
+        exchange_type: MarketType = "spot",
+        symbol: str | None = None,
+        symbols: str | Sequence[str] | Iterable[str] | None = None,
+        save_path: str | Path | None = None,
+        include_raw: bool = False,
+        limit: int | None = None,
+    ) -> int:
+        target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
+        return await self._consume(
+            channel="quotes",
+            exchange_type=exchange_type,
+            symbols=target_symbols,
+            save_path=save_path,
+            include_raw=include_raw,
+            limit=limit,
+        )
+
+    async def funding_rate(
+        self,
+        *,
+        exchange_type: MarketType = "swap",
+        symbol: str | None = None,
+        symbols: str | Sequence[str] | Iterable[str] | None = None,
+        save_path: str | Path | None = None,
+        include_raw: bool = False,
+        limit: int | None = None,
+    ) -> int:
+        target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
+        return await self._consume(
+            channel="funding_rate",
+            exchange_type=exchange_type,
+            symbols=target_symbols,
+            save_path=save_path,
+            include_raw=include_raw,
+            limit=limit,
+        )
+
+    async def open_interest(
+        self,
+        *,
+        exchange_type: MarketType = "swap",
+        symbol: str | None = None,
+        symbols: str | Sequence[str] | Iterable[str] | None = None,
+        save_path: str | Path | None = None,
+        include_raw: bool = False,
+        limit: int | None = None,
+    ) -> int:
+        target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
+        return await self._consume(
+            channel="open_interest",
+            exchange_type=exchange_type,
+            symbols=target_symbols,
+            save_path=save_path,
+            include_raw=include_raw,
+            limit=limit,
+        )
+
+    async def mark_price(
+        self,
+        *,
+        exchange_type: MarketType = "swap",
+        symbol: str | None = None,
+        symbols: str | Sequence[str] | Iterable[str] | None = None,
+        save_path: str | Path | None = None,
+        include_raw: bool = False,
+        limit: int | None = None,
+    ) -> int:
+        target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
+        return await self._consume(
+            channel="mark_price",
+            exchange_type=exchange_type,
+            symbols=target_symbols,
+            save_path=save_path,
+            include_raw=include_raw,
+            limit=limit,
+        )
+
+    async def index_price(
+        self,
+        *,
+        exchange_type: MarketType = "swap",
+        symbol: str | None = None,
+        symbols: str | Sequence[str] | Iterable[str] | None = None,
+        save_path: str | Path | None = None,
+        include_raw: bool = False,
+        limit: int | None = None,
+    ) -> int:
+        target_symbols = _normalize_symbols(symbol=symbol, symbols=symbols)
+        return await self._consume(
+            channel="index_price",
+            exchange_type=exchange_type,
+            symbols=target_symbols,
+            save_path=save_path,
+            include_raw=include_raw,
+            limit=limit,
+        )
+
+
+class CoinWSEntry:
+    def __init__(
+        self,
+        *,
+        exchange: ExchangeName,
+        proxy: str | None = None,
+        reconnect_delay: float = 1.0,
+        max_reconnect_delay: float = 30.0,
+    ) -> None:
+        self.exchange = exchange
+        self._client = CoinWS(
+            proxy=proxy,
+            reconnect_delay=reconnect_delay,
+            max_reconnect_delay=max_reconnect_delay,
+        )
+        self.ws = WSFacade(client=self._client, exchange=exchange)
+
+
+def coinws(
+    *,
+    exchange: ExchangeName,
+    proxy: str | None = None,
+    reconnect_delay: float = 1.0,
+    max_reconnect_delay: float = 30.0,
+) -> CoinWSEntry:
+    return CoinWSEntry(
+        exchange=exchange,
+        proxy=proxy,
+        reconnect_delay=reconnect_delay,
+        max_reconnect_delay=max_reconnect_delay,
+    )

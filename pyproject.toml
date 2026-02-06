@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coinws"
+version = "0.1.0"
+description = "Unified asyncio WebSocket market data client for Binance, OKX and Gate.io"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [
+  { name = "coinws maintainers" }
+]
+keywords = ["crypto", "websocket", "binance", "okx", "gate", "market-data"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Framework :: AsyncIO",
+  "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+  "websockets>=12.0,<16.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/phycxli/coinws"
+Repository = "https://github.com/phycxli/coinws"
+Issues = "https://github.com/phycxli/coinws/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+coinws = ["py.typed"]
+
